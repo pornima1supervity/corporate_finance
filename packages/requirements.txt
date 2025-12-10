@@ -16,3 +16,11 @@ python-json-logger
 sqlalchemy
 psycopg2-binary
 alembic
+
+# Vector Database Client
+chromadb-client
+
+# AI & Document Processing
+google-generativeai
+pypdf
+python-docx

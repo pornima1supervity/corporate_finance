@@ -2,6 +2,7 @@
 import logging
 import os
 from datetime import datetime, timezone
+import io
 
 import geoip2.database
 from fastapi import APIRouter, Depends, FastAPI, Header, Request
@@ -17,6 +18,8 @@ from .core.database import get_db
 from .core.logging_config import setup_logging
 # Import the authentication dependency and the authorization engine instance
 from .security import authz_engine, get_current_user, verify_access
+# NEW: Import FinVerse services
+from .services import document_store, retrieval_engine, ai_service
 
 # --- Logger Initialization ---
 # Get a logger for this module
@@ -27,6 +30,7 @@ log = logging.getLogger(__name__)
 # All data is now managed through SQLAlchemy ORM models
 # To use Geofencing, you must download the free GeoLite2-Country.mmdb database from MaxMind's website
 # and place it in the root directory of your project. Run: pip install geoip2
+
 try:
     geoip_reader = geoip2.database.Reader("/app/app/GeoLite2-Country.mmdb")
 except FileNotFoundError:
@@ -38,6 +42,8 @@ except FileNotFoundError:
 class PurchaseOrder(BaseModel):
     amount: int
 
+class FinVerseQuery(BaseModel):
+    question: str
 
 class FileUpload(BaseModel):
     size: int
@@ -200,7 +206,73 @@ def get_secure_asset(
     )
     return {"asset": "Top Secret Data"}
 
+@api_router.post("/documents/upload", tags=["FinVerse"])
+async def upload_document(file: UploadFile = File(...)):
+    """
+    Uploads a document to the central data corpus (Azure Blob Storage).
+    Requires 'data-manager' role (defined in authz.map.json).
+    """
+    try:
+        file_content = await file.read()
+        result = document_store.upload_file(file.filename, file_content)
+        return {"status": "success", "detail": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
+@api_router.post("/documents/{document_name}/process", tags=["FinVerse"])
+def process_document(document_name: str, db: Session = Depends(get_db)):
+    """
+    Triggers the AI processing and embedding pipeline for a specified document.
+    Requires 'admin' role (defined in authz.map.json).
+    This is an intensive operation and should ideally be a background task in production.
+    """
+    try:
+        retrieval_engine.process_and_embed_document(document_name, db)
+        return {"status": "success", "detail": f"Processing job started for {document_name}."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/finverse/query", tags=["FinVerse"])
+def query_finverse(query: FinVerseQuery, db: Session = Depends(get_db)):
+    """
+    Accepts a natural language question, retrieves relevant context from the
+    vector database, and generates an answer using the Gemini LLM.
+    """
+    try:
+        # 1. Embed the user's question
+        log.info(f"Received query: {query.question}")
+        query_embedding = ai_service.get_text_embedding(query.question)
+
+        # 2. Search the vector database for relevant chunks
+        chroma_client = retrieval_engine.get_chroma_client()
+        collection = chroma_client.get_collection(retrieval_engine.CHROMA_COLLECTION_NAME)
+        
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=5 # Retrieve top 5 most relevant chunks
+        )
+
+        retrieved_vector_ids = results['ids'][0]
+        if not retrieved_vector_ids:
+            return {"answer": "I could not find any relevant information in the document corpus to answer your question."}
+        
+        # 3. Fetch the full text of the chunks from PostgreSQL using the vector IDs
+        context_chunks = db.query(models.DocumentChunk.chunk_text)\
+            .filter(models.DocumentChunk.vector_id.in_(retrieved_vector_ids))\
+            .all()
+        
+        context_texts = [item[0] for item in context_chunks]
+        log.info(f"Retrieved {len(context_texts)} context chunks for generation.")
+
+        # 4. Generate the final answer using the LLM
+        answer = ai_service.generate_answer_from_context(query.question, context_texts)
+
+        return {"answer": answer, "sources": results['metadatas'][0]}
+
+    except Exception as e:
+        log.error(f"Error during query processing: {e}")
+        raise HTTPException(status_code=500, detail="An error occurred while processing your query.")
 # For additional context-aware scenarios, see the authorization documentation
 
 # Include the router in the main app
